@@ -21,6 +21,8 @@ logging.basicConfig(
 )
 
 kp: Optional[PyKeePass] = None
+CARD_FOLDER_ID = 'F6C4255D-9260-4407-A4F6-AF773D179F67'
+
 
 def bitwarden_to_keepass(args):
     global kp
@@ -33,6 +35,8 @@ def bitwarden_to_keepass(args):
         logging.error(f'Wrong password for KeePass database: {e}')
         return
 
+    sync = subprocess.check_output([args.bw_path, 'sync', '--session', args.bw_session], encoding='utf8')
+
     folders = subprocess.check_output([args.bw_path, 'list', 'folders', '--session', args.bw_session], encoding='utf8')
     folders = json.loads(folders)
     groups_by_id = load_folders(folders)
@@ -42,17 +46,28 @@ def bitwarden_to_keepass(args):
     items = json.loads(items)
     logging.info(f'Starting to process {len(items)} items.')
     for item in items:
-        if item['type'] in [ItemTypes.CARD, ItemTypes.IDENTITY]:
-            logging.warning(f'Skipping credit card or identity item "{item["name"]}".')
-            continue
 
         bw_item = Item(item)
 
         is_duplicate_title = False
-        try:
-            while True:
-                entry_title = bw_item.get_name() if not is_duplicate_title else '{name} - ({item_id}'.format(name=bw_item.get_name(), item_id=bw_item.get_id())
-                try:
+        while True:
+            entry_title = bw_item.get_name() if not is_duplicate_title else '{name} - ({item_id}'.format(
+                name=bw_item.get_name(), item_id=bw_item.get_id())
+            try:
+                if item['type'] in [ItemTypes.CARD, ItemTypes.IDENTITY]:
+                    entry = kp.add_entry(
+                        destination_group=groups_by_id[CARD_FOLDER_ID],
+                        title=entry_title,
+                        username=bw_item.item['card']['cardholderName'],
+                        password=bw_item.item['card']['number'],
+                        notes=bw_item.get_notes()
+                    )
+                    card = bw_item.get_card()
+                    entry.set_custom_property('_BW_CARD_BRAND', card.get_brand())
+                    entry.set_custom_property('_BW_CARD_EXP_YEAR', card.get_exp_year())
+                    entry.set_custom_property('_BW_CARD_EXP_MONTH', card.get_exp_month())
+                    entry.set_custom_property('_BW_CARD_CVV', card.get_code())
+                else:
                     entry = kp.add_entry(
                         destination_group=groups_by_id[bw_item.get_folder_id()],
                         title=entry_title,
@@ -60,40 +75,48 @@ def bitwarden_to_keepass(args):
                         password=bw_item.get_password(),
                         notes=bw_item.get_notes()
                     )
-                    break
-                except Exception as e:
-                    if 'already exists' in str(e):
-                        is_duplicate_title = True
-                        continue
-                    raise
+                    # password history
+                    if 'passwordHistory' in bw_item.item:
+                        history_str = ''
+                        for pass_history in bw_item.item['passwordHistory']:
+                            history_str = history_str + "{}\t{}".format(pass_history['lastUsedDate'],
+                                                                        pass_history['password']) + '\n'
+                        entry.set_custom_property('_BW_PASSWORD_HISTORY', history_str)
+                break
+            except Exception as e:
+                if 'already exists' in str(e):
+                    is_duplicate_title = True
+                    continue
+                raise
 
-            totp_secret, totp_settings = bw_item.get_totp()
-            if totp_secret and totp_settings:
-                entry.set_custom_property('TOTP Seed', totp_secret)
-                entry.set_custom_property('TOTP Settings', totp_settings)
+        totp_secret, totp_settings = bw_item.get_totp()
+        if totp_secret and totp_settings:
+            entry.set_custom_property('TOTP Seed', totp_secret)
+            entry.set_custom_property('TOTP Settings', totp_settings)
 
-            for uri in bw_item.get_uris():
+        for index, uri in enumerate(bw_item.get_uris()):
+            if index == 0:
                 entry.url = uri['uri']
-                break # todo append additional uris to notes?
+            else:
+                entry.set_custom_property('KP2A_URL_' + str(index), uri['uri'])
 
-            for field in bw_item.get_custom_fields():
-                entry.set_custom_property(field['name'], field['value'])
+        for field in bw_item.get_custom_fields():
+            entry.set_custom_property(field['name'], field['value'])
 
-            for attachment in bw_item.get_attachments():
-                attachment_raw = subprocess.check_output([
-                    args.bw_path, 'get', 'attachment', attachment['id'], '--raw', '--itemid', bw_item.get_id(),
-                    '--session', args.bw_session,
-                ])
-                attachment_id = kp.add_binary(attachment_raw)
-                entry.add_attachment(attachment_id, attachment['fileName'])
+        for attachment in bw_item.get_attachments():
+            attachment_raw = subprocess.check_output([
+                args.bw_path, 'get', 'attachment', attachment['id'], '--raw', '--itemid', bw_item.get_id(),
+                '--session', args.bw_session,
+            ])
+            attachment_id = kp.add_binary(attachment_raw)
+            entry.add_attachment(attachment_id, attachment['fileName'])
 
-        except Exception as e:
-            logging.warning(f'Skipping item named "{item["name"]}" because of this error: {repr(e)}')
-            continue
+        entry.set_custom_property('_BW_UPDATE_DATE', bw_item.item['revisionDate'])
 
     logging.info('Saving changes to KeePass database.')
     kp.save()
     logging.info('Export completed.')
+
 
 def load_folders(folders) -> Dict[str, KPGroup]:
     # sort folders so that in the case of nested folders, the parents would be guaranteed to show up before the children
@@ -120,6 +143,10 @@ def load_folders(folders) -> Dict[str, KPGroup]:
         new_group: KPGroup = kp.add_group(parent_group, folder.name)
         folder.keepass_group = new_group
         groups_by_id[folder.id] = new_group
+
+    # add card folder
+    new_folder: FolderType.Folder = FolderType.Folder(CARD_FOLDER_ID)
+    FolderType.nested_traverse_insert(folder_root, ['支付卡'], new_folder, '/')
 
     FolderType.bfs_traverse_execute(folder_root, add_keepass_group)
 

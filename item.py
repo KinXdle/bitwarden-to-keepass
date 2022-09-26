@@ -76,3 +76,23 @@ class Item:
         secret = params.get('secret', self.item['login']['totp'])
 
         return secret, f'{period};{digits}'
+
+    def get_card(self):
+        return CARD(self.item)
+
+
+class CARD:
+    def __init__(self, item):
+        self.card = item['card'] if item['card'] else {}
+
+    def get_brand(self):
+        return self.card['brand'] if self.card['brand'] else ''
+
+    def get_exp_year(self):
+        return self.card['expYear'] if self.card['expYear'] else ''
+
+    def get_exp_month(self):
+        return self.card['expMonth'] if self.card['expMonth'] else ''
+
+    def get_code(self):
+        return self.card['code'] if self.card['code'] else ''

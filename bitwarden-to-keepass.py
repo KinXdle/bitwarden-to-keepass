@@ -3,14 +3,14 @@ import logging
 import os
 import re
 import subprocess
-
+import datetime
 from argparse import ArgumentParser
 from typing import Dict, List, Optional
 
 from pykeepass import PyKeePass, create_database
 from pykeepass.exceptions import CredentialsError
 from pykeepass.group import Group as KPGroup
-
+from dateutil import parser
 import folder as FolderType
 from item import Item, Types as ItemTypes
 
@@ -50,6 +50,10 @@ def bitwarden_to_keepass(args):
         bw_item = Item(item)
 
         is_duplicate_title = False
+
+        create_time = None
+        modify_time = None
+
         while True:
             entry_title = bw_item.get_name() if not is_duplicate_title else '{name} - ({item_id}'.format(
                 name=bw_item.get_name(), item_id=bw_item.get_id())
@@ -63,10 +67,10 @@ def bitwarden_to_keepass(args):
                         notes=bw_item.get_notes()
                     )
                     card = bw_item.get_card()
-                    entry.set_custom_property('_BW_CARD_BRAND', card.get_brand())
-                    entry.set_custom_property('_BW_CARD_EXP_YEAR', card.get_exp_year())
-                    entry.set_custom_property('_BW_CARD_EXP_MONTH', card.get_exp_month())
-                    entry.set_custom_property('_BW_CARD_CVV', card.get_code())
+                    entry.set_custom_property('_BW_CARD_BRAND', card.get_brand(), True)
+                    entry.set_custom_property('_BW_CARD_EXP_YEAR', card.get_exp_year(), True)
+                    entry.set_custom_property('_BW_CARD_EXP_MONTH', card.get_exp_month(), True)
+                    entry.set_custom_property('_BW_CARD_CVV', card.get_code(), True)
                 else:
                     entry = kp.add_entry(
                         destination_group=groups_by_id[bw_item.get_folder_id()],
@@ -79,9 +83,21 @@ def bitwarden_to_keepass(args):
                     if 'passwordHistory' in bw_item.item:
                         history_str = ''
                         for pass_history in bw_item.item['passwordHistory']:
-                            history_str = history_str + "{}\t{}".format(pass_history['lastUsedDate'],
-                                                                        pass_history['password']) + '\n'
-                        entry.set_custom_property('_BW_PASSWORD_HISTORY', history_str)
+                            _lastUsedDate = pass_history['lastUsedDate']
+                            _password_history = pass_history['password']
+                            history_str = history_str + "{}\t{}".format(_lastUsedDate, _password_history) + '\n'
+                            _lastUsedDate_date = datetime.datetime.strptime(_lastUsedDate, "%Y-%m-%dT%H:%M:%S.%fZ")
+                            if create_time is None:
+                                create_time = _lastUsedDate_date
+                            elif create_time > _lastUsedDate_date:
+                                create_time = _lastUsedDate_date
+
+                            if modify_time is None:
+                                modify_time = _lastUsedDate_date
+                            elif modify_time < _lastUsedDate_date:
+                                modify_time = _lastUsedDate_date
+
+                        entry.set_custom_property('_BW_PASSWORD_HISTORY', history_str, True)
                 break
             except Exception as e:
                 if 'already exists' in str(e):
@@ -91,8 +107,8 @@ def bitwarden_to_keepass(args):
 
         totp_secret, totp_settings = bw_item.get_totp()
         if totp_secret and totp_settings:
-            entry.set_custom_property('TOTP Seed', totp_secret)
-            entry.set_custom_property('TOTP Settings', totp_settings)
+            entry.set_custom_property('TOTP Seed', totp_secret, True)
+            entry.set_custom_property('TOTP Settings', totp_settings, True)
 
         for index, uri in enumerate(bw_item.get_uris()):
             if index == 0:
@@ -111,8 +127,22 @@ def bitwarden_to_keepass(args):
             attachment_id = kp.add_binary(attachment_raw)
             entry.add_attachment(attachment_id, attachment['fileName'])
 
-        entry.set_custom_property('_BW_UPDATE_DATE', bw_item.item['revisionDate'])
+        # add bw_id
+        entry.set_custom_property('_BW_ID', bw_item.get_id())
+        # add bw_folder_id
+        if bw_item.get_folder_id():
+            entry.set_custom_property('_BW_FOLDER_ID', bw_item.get_folder_id())
+        # set date
+        bw_modify_date = datetime.datetime.strptime(bw_item.item['revisionDate'], "%Y-%m-%dT%H:%M:%S.%fZ")
+        if create_time is None:
+            create_time = bw_modify_date
+        if modify_time is None:
+            modify_time = bw_modify_date
+        elif modify_time < bw_modify_date:
+            modify_time = bw_modify_date
 
+        entry.ctime = create_time
+        entry.mtime = modify_time
     logging.info('Saving changes to KeePass database.')
     kp.save()
     logging.info('Export completed.')
